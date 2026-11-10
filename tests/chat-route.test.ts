@@ -1,6 +1,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { POST } from "../src/app/api/chat/route";
+import { inputTokenBudget } from "../src/lib/chatLimits";
 
 const SERVER_KEY = "server-side-glm-key-test";
 
@@ -12,6 +13,9 @@ interface RecordedCall {
 
 const originalFetch = globalThis.fetch;
 const originalGlmKey = process.env.GLM_API_KEY;
+const limitEnvNames = ["CHAT_RATE_LIMIT_REQUESTS", "CHAT_RATE_LIMIT_WINDOW_MS", "CHAT_MAX_MESSAGES", "CHAT_MAX_TOKENS", "CHAT_MAX_OUTPUT_TOKENS", "CHAT_CLIENT_IP_HEADER"];
+const originalLimits = Object.fromEntries(limitEnvNames.map((key) => [key, process.env[key]]));
+let clientNumber = 0;
 let calls: RecordedCall[] = [];
 
 function completionResponse(): Response {
@@ -36,12 +40,13 @@ function completionResponse(): Response {
 function chatRequest(body: Record<string, unknown>): Request {
   return new Request("http://localhost/api/chat", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "x-vercel-forwarded-for": `2001:db8::${(++clientNumber).toString(16)}` },
     body: JSON.stringify({ messages: [{ role: "user", content: "hi" }], ...body }),
   });
 }
 
 beforeEach(() => {
+  for (const key of limitEnvNames) delete process.env[key];
   calls = [];
   process.env.GLM_API_KEY = SERVER_KEY;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -53,6 +58,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const key of limitEnvNames) {
+    if (originalLimits[key] === undefined) delete process.env[key];
+    else process.env[key] = originalLimits[key];
+  }
   globalThis.fetch = originalFetch;
   if (originalGlmKey === undefined) {
     delete process.env.GLM_API_KEY;
@@ -188,4 +197,88 @@ test("malformed model tool JSON receives an error rather than running a broad qu
   };
   assert.equal((await POST(chatRequest({}))).status, 200);
   assert.equal(outbound, 2);
+});
+
+test("anonymous server-key calls are limited per platform IP before reaching GLM", async () => {
+  process.env.CHAT_RATE_LIMIT_REQUESTS = "1";
+  const first = chatRequest({});
+  const second = chatRequest({});
+  second.headers.set("x-vercel-forwarded-for", first.headers.get("x-vercel-forwarded-for")!);
+  assert.equal((await POST(first)).status, 200);
+  second.headers.set("x-forwarded-for", "192.0.2.99"); // Untrusted header cannot bypass quota.
+  const blocked = await POST(second);
+  assert.equal(blocked.status, 429);
+  assert.ok(Number(blocked.headers.get("retry-after")) > 0);
+  assert.equal(calls.length, 1);
+  assert.equal((await POST(chatRequest({}))).status, 200); // Independent client.
+  const ownKey = chatRequest({ apiKey: "client-key-test" });
+  ownKey.headers.set("x-vercel-forwarded-for", first.headers.get("x-vercel-forwarded-for")!);
+  assert.equal((await POST(ownKey)).status, 200);
+});
+
+test("message count and UTF-8 input budgets reject excess before an upstream call", async () => {
+  process.env.CHAT_MAX_MESSAGES = "2";
+  const messages = Array.from({ length: 3 }, () => ({ role: "user", content: "hi" }));
+  assert.equal((await POST(chatRequest({ messages }))).status, 413);
+  delete process.env.CHAT_MAX_MESSAGES;
+  const largeMessages = Array.from({ length: 20 }, () => ({ role: "user", content: "汉".repeat(4000) }));
+  assert.equal((await POST(chatRequest({ messages: largeMessages }))).status, 413);
+  process.env.CHAT_MAX_TOKENS = "100";
+  assert.equal((await POST(chatRequest({}))).status, 413);
+  assert.equal(calls.length, 0);
+});
+
+test("output cap applies to the first call and every tool follow-up", async () => {
+  process.env.CHAT_MAX_OUTPUT_TOKENS = "128";
+  let outbound = 0;
+  globalThis.fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body));
+    assert.equal(body.max_tokens, 128);
+    if (outbound++ === 0) return Response.json({ choices: [{ finish_reason: "tool_calls", message: {
+      role: "assistant", content: null,
+      tool_calls: [{ id: "call-test", type: "function", function: { name: "unknown", arguments: "{}" } }],
+    } }] });
+    return completionResponse();
+  };
+  assert.equal((await POST(chatRequest({}))).status, 200);
+  assert.equal(outbound, 2);
+});
+
+test("total request budget stops oversized tool results before another upstream call", async () => {
+  let outbound = 0;
+  globalThis.fetch = async () => {
+    outbound++;
+    return Response.json({ choices: [{ finish_reason: "tool_calls", message: {
+      role: "assistant", content: "x".repeat(32_000),
+      tool_calls: [{ id: "call-test", type: "function", function: { name: "unknown", arguments: "{}" } }],
+    } }] });
+  };
+  assert.equal((await POST(chatRequest({}))).status, 413);
+  assert.equal(outbound, 1);
+});
+
+test("small tool rounds share one total input and output budget", async () => {
+  let reserved = 0;
+  let outbound = 0;
+  globalThis.fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body));
+    reserved += inputTokenBudget(body.messages, body.tools) + body.max_tokens;
+    assert.ok(body.max_tokens > 0 && body.max_tokens <= 4096);
+    assert.ok(reserved <= 32_000);
+    outbound++;
+    return Response.json({ choices: [{ finish_reason: "tool_calls", message: {
+      role: "assistant", content: null,
+      tool_calls: [{ id: `call-${outbound}`, type: "function", function: { name: "unknown", arguments: "{}" } }],
+    } }] });
+  };
+  assert.equal((await POST(chatRequest({}))).status, 413);
+  assert.ok(outbound > 1 && outbound < 6);
+});
+
+test("OpenAI reasoning models receive a compatible completion cap", async () => {
+  const res = await POST(chatRequest({ provider: "openai", model: "o4-mini", apiKey: "client-key-test" }));
+  assert.equal(res.status, 200);
+  const sent = JSON.parse(calls[0].body);
+  assert.equal(sent.max_completion_tokens, 4096);
+  assert.equal(sent.max_tokens, undefined);
 });

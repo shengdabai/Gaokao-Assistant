@@ -1,4 +1,5 @@
 import { executeToolCall } from "@/lib/chatTools";
+import { anonymousChatLimiter, clientIp, getChatLimits, inputTokenBudget } from "@/lib/chatLimits";
 import OpenAI from "openai";
 
 // Provider configurations - all OpenAI-compatible
@@ -232,6 +233,7 @@ export async function POST(request: Request) {
   }
 
   try {
+    const limits = getChatLimits();
     if (!body || !Array.isArray(body.messages) || !body.messages.length ||
       body.messages.some((m: unknown) => !m || typeof m !== "object" ||
         !("role" in m) || typeof m.role !== "string" || !["user", "assistant"].includes(m.role) ||
@@ -239,6 +241,9 @@ export async function POST(request: Request) {
       (body.apiKey !== undefined && (typeof body.apiKey !== "string" || body.apiKey.length > 4096)) ||
       (body.model !== undefined && (typeof body.model !== "string" || body.model.length > 200))) {
       return Response.json({ error: "请求格式无效" }, { status: 400 });
+    }
+    if (body.messages.length > limits.maxMessages) {
+      return Response.json({ error: "消息数量超过请求上限" }, { status: 413 });
     }
 
     // Get provider config from request
@@ -289,12 +294,35 @@ export async function POST(request: Request) {
       })),
     ];
 
-    let response = await client.chat.completions.create({
-      model,
-      messages: openaiMessages,
-      tools,
-      tool_choice: "auto",
-    }, { signal: request.signal });
+    if (inputTokenBudget(openaiMessages, tools) + limits.maxOutputTokens > limits.maxTokens) {
+      return Response.json({ error: "消息内容超过请求预算" }, { status: 413 });
+    }
+    if (!clientApiKey) {
+      const retryAfter = anonymousChatLimiter.consume(clientIp(request.headers), limits.requests, limits.windowMs);
+      if (retryAfter) {
+        return Response.json({ error: "请求过于频繁，请稍后重试" }, {
+          status: 429, headers: { "Retry-After": String(retryAfter) },
+        });
+      }
+    }
+
+    let remainingTokens = limits.maxTokens;
+    const complete = async () => {
+      const inputTokens = inputTokenBudget(openaiMessages, tools);
+      const outputTokens = Math.min(limits.maxOutputTokens, remainingTokens - inputTokens);
+      if (outputTokens < 1) return null;
+      remainingTokens -= inputTokens + outputTokens;
+      return client.chat.completions.create({
+        model,
+        messages: openaiMessages,
+        tools,
+        tool_choice: "auto",
+        // OpenAI reasoning models require max_completion_tokens; other
+        // OpenAI-compatible providers use the legacy max_tokens parameter.
+        ...(providerKey === "openai" ? { max_completion_tokens: outputTokens } : { max_tokens: outputTokens }),
+      }, { signal: request.signal });
+    };
+    let response = (await complete())!;
 
     let choice = response.choices[0];
 
@@ -324,12 +352,11 @@ export async function POST(request: Request) {
         });
       }
 
-      response = await client.chat.completions.create({
-        model,
-        messages: openaiMessages,
-        tools,
-        tool_choice: "auto",
-      }, { signal: request.signal });
+      const nextResponse = await complete();
+      if (!nextResponse) {
+        return Response.json({ error: "工具调用超过请求预算，请缩短问题后重试" }, { status: 413 });
+      }
+      response = nextResponse;
 
       choice = response.choices[0];
     }
