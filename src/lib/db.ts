@@ -33,6 +33,12 @@ export function getDb(): Database.Database {
     seedDb(_db);
   }
 
+  // These fields are required by queries, even if external imports never ran.
+  const columns = new Set((_db.pragma("table_info(schools)") as { name: string }[]).map(c => c.name));
+  for (const column of ["dorm_info", "food_info", "campus_info", "additional_comments"]) {
+    if (!columns.has(column)) _db.exec(`ALTER TABLE schools ADD COLUMN ${column} TEXT DEFAULT ''`);
+  }
+
   return _db;
 }
 
@@ -219,7 +225,7 @@ export function searchPrograms(filters: SearchFilters) {
   const params: (string | number)[] = [];
 
   if (filters.city) {
-    const alias = REGION_ALIASES[filters.city];
+    const alias = Object.hasOwn(REGION_ALIASES, filters.city) ? REGION_ALIASES[filters.city] : undefined;
     if (alias) {
       const cityConditions = alias.map(() => "s.city LIKE ?").join(" OR ");
       conditions.push(`(${cityConditions})`);
@@ -495,7 +501,7 @@ export function rankByDormQuality(filters: { city?: string; limit?: number }) {
   const params: (string | number)[] = [];
 
   if (filters.city) {
-    const alias = REGION_ALIASES[filters.city];
+    const alias = Object.hasOwn(REGION_ALIASES, filters.city) ? REGION_ALIASES[filters.city] : undefined;
     if (alias) {
       const cityConditions = alias.map(() => "s.city LIKE ?").join(" OR ");
       conditions.push(`(${cityConditions})`);

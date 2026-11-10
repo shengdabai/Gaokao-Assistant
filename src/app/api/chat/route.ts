@@ -1,4 +1,4 @@
-import { searchPrograms, getSchoolInfo, compareSchools, getStatistics, rankByDormQuality } from "@/lib/db";
+import { executeToolCall } from "@/lib/chatTools";
 import OpenAI from "openai";
 
 // Provider configurations - all OpenAI-compatible
@@ -181,23 +181,6 @@ const tools: OpenAI.ChatCompletionTool[] = [
   },
 ];
 
-function executeToolCall(name: string, args: Record<string, unknown>): unknown {
-  switch (name) {
-    case "search_programs":
-      return searchPrograms(args as Parameters<typeof searchPrograms>[0]);
-    case "get_school_info":
-      return getSchoolInfo((args as { school_name: string }).school_name);
-    case "compare_schools":
-      return compareSchools((args as { school_names: string[] }).school_names);
-    case "get_statistics":
-      return getStatistics((args as { dimension: string }).dimension);
-    case "rank_by_dorm_quality":
-      return rankByDormQuality(args as { city?: string; limit?: number });
-    default:
-      return { error: "Unknown tool" };
-  }
-}
-
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
@@ -208,19 +191,62 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const origin = request.headers.get("origin");
+  let originHost;
   try {
-    const body = await request.json();
+    originHost = origin ? new URL(origin).host : undefined;
+  } catch {
+    return Response.json({ error: "不允许跨站请求" }, { status: 403 });
+  }
+  // Next.js may construct an internal URL; Host retains the browser-facing host.
+  const host = request.headers.get("host") || new URL(request.url).host;
+  if ((origin && originHost !== host) || request.headers.get("sec-fetch-site") === "cross-site") {
+    return Response.json({ error: "不允许跨站请求" }, { status: 403 });
+  }
 
-    if (!body || !Array.isArray(body.messages)) {
+  // Bound actual bytes read, including chunked requests without Content-Length.
+  const reader = request.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let body;
+  try {
+    if (reader) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 1024 * 1024) {
+            await reader.cancel();
+            return Response.json({ error: "请求过大" }, { status: 413 });
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return Response.json({ error: "请求格式无效" }, { status: 400 });
+  }
+
+  try {
+    if (!body || !Array.isArray(body.messages) || !body.messages.length ||
+      body.messages.some((m: unknown) => !m || typeof m !== "object" ||
+        !("role" in m) || typeof m.role !== "string" || !["user", "assistant"].includes(m.role) ||
+        !("content" in m) || typeof m.content !== "string") ||
+      (body.apiKey !== undefined && (typeof body.apiKey !== "string" || body.apiKey.length > 4096)) ||
+      (body.model !== undefined && (typeof body.model !== "string" || body.model.length > 200))) {
       return Response.json({ error: "请求格式无效" }, { status: 400 });
     }
 
     // Get provider config from request
-    const providerKey = body.provider || "glm";
-    const providerConfig = PROVIDERS[providerKey];
-    if (!providerConfig) {
-      return Response.json({ error: `不支持的模型提供商: ${providerKey}` }, { status: 400 });
+    const providerKey = body.provider ?? "glm";
+    if (typeof providerKey !== "string" || !Object.hasOwn(PROVIDERS, providerKey)) {
+      return Response.json({ error: "不支持的模型提供商" }, { status: 400 });
     }
+    const providerConfig = PROVIDERS[providerKey];
 
     const model = body.model || providerConfig.defaultModel;
 
@@ -243,14 +269,16 @@ export async function POST(request: Request) {
     const client = new OpenAI({
       apiKey,
       baseURL: providerConfig.baseURL,
+      timeout: 60_000,
+      maxRetries: 0,
     });
 
     const MAX_MESSAGES = 50;
     const MAX_CONTENT_LENGTH = 4000;
 
-    const messages: ChatMessage[] = body.messages.slice(0, MAX_MESSAGES).map((m: Record<string, unknown>) => ({
-      role: ["user", "assistant"].includes(String(m.role)) ? String(m.role) as "user" | "assistant" : "user",
-      content: typeof m.content === "string" ? m.content.slice(0, MAX_CONTENT_LENGTH) : "",
+    const messages: ChatMessage[] = body.messages.slice(-MAX_MESSAGES).map((m: Record<string, unknown>) => ({
+      role: m.role as ChatMessage["role"],
+      content: (m.content as string).slice(0, MAX_CONTENT_LENGTH),
     }));
 
     const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
@@ -266,7 +294,7 @@ export async function POST(request: Request) {
       messages: openaiMessages,
       tools,
       tool_choice: "auto",
-    });
+    }, { signal: request.signal });
 
     let choice = response.choices[0];
 
@@ -279,12 +307,9 @@ export async function POST(request: Request) {
         if (toolCall.type !== "function") continue;
         const fn = toolCall.function;
 
-        let args: Record<string, unknown> = {};
+        let args: unknown;
         try {
-          const parsedArgs = JSON.parse(fn.arguments);
-          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
-            args = parsedArgs as Record<string, unknown>;
-          }
+          args = JSON.parse(fn.arguments);
         } catch {
           // Suppress tool name from logs to avoid internal detail leakage
           console.warn("Invalid tool arguments received");
@@ -304,7 +329,7 @@ export async function POST(request: Request) {
         messages: openaiMessages,
         tools,
         tool_choice: "auto",
-      });
+      }, { signal: request.signal });
 
       choice = response.choices[0];
     }
@@ -313,12 +338,13 @@ export async function POST(request: Request) {
 
     return Response.json({ message: assistantMessage });
   } catch (error) {
-    console.error("Chat API error:", error);
-    const msg = error instanceof Error ? error.message : "";
-    if (msg.includes("401") || msg.includes("auth") || msg.includes("API key")) {
+    // Upstream errors can contain credentials, request headers and user content.
+    const status = error instanceof OpenAI.APIError ? error.status : undefined;
+    console.error("Chat API error", { status: status ?? "unexpected" });
+    if (status === 401 || status === 403) {
       return Response.json({ error: "API Key 无效或已过期，请在设置中检查" }, { status: 401 });
     }
-    if (msg.includes("429") || msg.includes("rate")) {
+    if (status === 429) {
       return Response.json({ error: "请求过于频繁，请稍后重试" }, { status: 429 });
     }
     return Response.json({ error: "服务暂时不可用，请稍后重试。" }, { status: 500 });
