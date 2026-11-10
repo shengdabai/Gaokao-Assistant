@@ -130,7 +130,7 @@ export function SettingsModal({
             value={settings.provider}
             onChange={(e) => {
               const p = providers.find((x) => x.id === e.target.value);
-              setSettings((s) => ({ ...s, provider: e.target.value, model: p?.defaultModel || s.model }));
+              setSettings((s) => ({ ...s, provider: e.target.value, model: p?.defaultModel || s.model, apiKey: "" }));
             }}
             className="w-full px-3 py-2 rounded-xl text-sm border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
           >
